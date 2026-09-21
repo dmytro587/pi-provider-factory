@@ -1,3 +1,7 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import type { ProviderConfig } from "@oh-my-pi/pi-coding-agent";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { Api, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
@@ -5,13 +9,14 @@ import { createProviderErrorMessage } from "@oh-my-pi/pi-ai/providers/error-mess
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { streamSimple, type AssistantMessage, type Context } from "@oh-my-pi/pi-ai";
 
-import { familyOf, upstreamProviderFor } from "./catalog";
+import { familyOf, grokReasoningEffortMap, grokThinking, upstreamProviderFor } from "./catalog";
 import {
   ANTHROPIC_VERSION,
   FACTORY_API,
   FACTORY_API_BASE_OVERRIDDEN,
   FACTORY_HEADERS,
   FACTORY_OPENAI_PLATFORM_ORG,
+  FACTORY_CLIENT_VERSION,
   FACTORY_ORG_ID,
   PROVIDER_ID,
 } from "./constants";
@@ -232,8 +237,15 @@ function targetApiFor(modelId: string): FactoryTargetApi | null {
   switch (familyOf(modelId)) {
     case "anthropic":
       return "anthropic-messages";
+    // Grok rides the OpenAI Responses wire through Factory's gateway
+    // (droid 0.210.0 gateway map: xai → /api/llm/o/v1/responses); only the
+    // `x-api-provider` upstream differs.
     case "openai-responses":
+    case "xai-responses":
       return "openai-responses";
+    // Gemini rides the OpenAI chat-completions wire (x-api-provider: google;
+    // live-verified 200 on 0.209.0 headers with a system-role message).
+    case "google-completions":
     case "openai-completions":
       return "openai-completions";
     case "unsupported":
@@ -252,14 +264,30 @@ function buildRequestHeaders(options: Parameters<NonNullable<ProviderConfig["str
   };
 }
 
-// Factory's gateway only accepts requests whose system field carries droid's
-// own system prompt (a client-attestation gate); any other system content —
-// `system` message, Anthropic top-level `system`, or OpenAI `instructions` —
-// is refused with `403 Forbidden`. Requests with NO system field are accepted.
-// So for every route we move OMP's system prompt out of the system channel and
-// into the first user message, leaving the system field empty. Observed against
-// the Factory gateway across all three routes (anthropic / responses / chat).
-function foldSystemPromptIntoUserMessage(context: Context): Context {
+const CONTRACT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".contract");
+
+function droidSystemPromptPath(targetApi: FactoryTargetApi): string {
+  const route =
+    targetApi === "anthropic-messages" ? "messages" : targetApi === "openai-responses" ? "responses" : "chat";
+
+  return path.join(CONTRACT_DIR, `droid-${FACTORY_CLIENT_VERSION}-system-${route}.txt`);
+}
+
+export function loadDroidSystemPrompt(targetApi: FactoryTargetApi) {
+  try {
+    const text = fs.readFileSync(droidSystemPromptPath(targetApi), "utf8");
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+// Live-verify on Droid 0.209.0: verbatim Droid body + omp token = 200 on every
+// route; empty system and generic/"helpful assistant" system = 403. So OMP's
+// own prompt cannot occupy the system channel. Fold it into the first user
+// message, then prefix the locally captured Droid prompt (gitignored under
+// `.contract/`) as the system field. That file is not committed.
+export function foldSystemPromptIntoUserMessage(context: Context): Context {
   const systemText = context.systemPrompt?.filter((part) => part.length > 0).join("\n\n");
 
   if (!systemText) {
@@ -297,29 +325,89 @@ function foldSystemPromptIntoUserMessage(context: Context): Context {
   };
 }
 
-function buildTargetModel(
+// omp 18.x materializes registered models through its own buildModel, tagging
+// each with an `identity` record (`{ class, family?, revision? }`) that its
+// request path dereferences unconditionally (`model.identity.class` — gpt-oss
+// detection in the OpenAI-family message converters, service-tier family
+// resolution). omp's extension import shim swaps `@oh-my-pi/pi-ai` for its
+// bundled 18.x code but leaves `@oh-my-pi/pi-catalog` on this repo's pinned
+// 16.x, whose buildModel emits no identity. The identity omp resolved for the
+// session model (same provider, same id, so the same classification) must be
+// carried onto the gateway target explicitly, or every Factory request on the
+// Responses wire dies with "undefined is not an object (evaluating
+// 'e.identity.class')" before any network call and omp falls back to another
+// model.
+// Mirrors omp's bounded-token classification for the model families this
+// provider ships, so a session model that arrives without an identity record
+// (omp < 18, or a static-overlay model that was never re-materialized) still
+// gets one. `class` drives omp 18's gpt-oss detection, thinking-loop guard
+// (xai/gemini/deepseek), and service-tier family resolution.
+type OmpModelIdentity = { class: string; family?: string; revision?: string };
+
+function identityFor(model: Model<Api>): OmpModelIdentity {
+  const { identity } = model as Model<Api> & { identity?: OmpModelIdentity };
+
+  if (identity) {
+    return identity;
+  }
+
+  const id = model.id.toLowerCase();
+
+  if (id.startsWith("grok-")) {
+    const version = /^grok-(\d+(?:\.\d+)*)/.exec(id)?.[1];
+    const revision = version === undefined ? undefined : version.split(".").length >= 3 ? version : `${version}.0`;
+
+    return { class: "xai", family: "grok", ...(revision ? { revision } : {}) };
+  }
+
+  const identityClassByPrefix: [string, string][] = [
+    ["claude-", "anthropic"],
+    ["gpt-", "openai"],
+    ["gemini-", "gemini"],
+    ["glm-", "glm"],
+    ["kimi-", "kimi"],
+    ["deepseek-", "deepseek"],
+    ["minimax-", "minimax"],
+    ["nemotron-", "nvidia"],
+  ];
+  const matched = identityClassByPrefix.find(([prefix]) => id.startsWith(prefix));
+
+  return matched ? { class: matched[1] } : { class: "unknown" };
+}
+
+export function buildTargetModel(
   model: Model<Api>,
   targetApi: FactoryTargetApi,
   orgId: string | null,
   apiEndpoint: string,
-): Model<FactoryTargetApi> {
+): Model<FactoryTargetApi> & { identity?: OmpModelIdentity } {
   const isAnthropic = targetApi === "anthropic-messages";
   const baseUrl = isAnthropic ? `${apiEndpoint}/api/llm/a` : `${apiEndpoint}/api/llm/o/v1`;
   const headers: Record<string, string> = { ...FACTORY_HEADERS, "x-api-provider": upstreamProviderFor(model.id) };
 
   if (isAnthropic) {
     headers["anthropic-version"] = ANTHROPIC_VERSION;
+    // Droid 0.209.0 sends a single beta flag; the July two-flag list is gone.
+    headers["anthropic-beta"] = "fine-grained-tool-streaming-2025-05-14";
   }
 
-  if (targetApi === "openai-responses") {
+  if (targetApi === "openai-completions") {
+    headers["x-provider-routing-source"] = "registry_default";
+  }
+
+  // OpenAI-Platform org and session_lock only apply to the OpenAI upstream;
+  // Grok shares the Responses wire but 403s under an OpenAI platform org.
+  if (targetApi === "openai-responses" && upstreamProviderFor(model.id) === "openai") {
     headers["OpenAI-Platform"] = FACTORY_OPENAI_PLATFORM_ORG;
+    headers["x-provider-routing-source"] = "session_lock";
   }
 
   if (orgId) {
     headers["X-Factory-Org-Id"] = orgId;
   }
 
-  const spec: ModelSpec<FactoryTargetApi> = {
+  const grokEffortMap = grokReasoningEffortMap(model.id);
+  const spec: ModelSpec<FactoryTargetApi> & { identity?: OmpModelIdentity } = {
     provider: PROVIDER_ID,
     id: model.id,
     name: model.name,
@@ -331,8 +419,20 @@ function buildTargetModel(
     premiumMultiplier: model.premiumMultiplier,
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
-    thinking: model.thinking,
+    thinking: grokThinking(model.id) ?? model.thinking,
     headers,
+    identity: identityFor(model),
+    // Factory's chat/responses gate looks at a `system` role (or top-level
+    // `instructions`). omp would otherwise emit `developer` for reasoning
+    // models on OpenAI-shaped hosts.
+    ...(targetApi === "openai-completions" || targetApi === "openai-responses"
+      ? {
+        compat: {
+          supportsDeveloperRole: false,
+          ...(grokEffortMap ? { supportsReasoningEffort: true, reasoningEffortMap: grokEffortMap } : {}),
+        },
+      }
+      : {}),
   };
 
   return buildModel(spec);
@@ -356,7 +456,15 @@ export const factoryStreamSimple: NonNullable<ProviderConfig["streamSimple"]> = 
     const apiEndpoint = FACTORY_API_BASE_OVERRIDDEN ? FACTORY_API : credential.apiEndpoint ?? FACTORY_API;
     const target = buildTargetModel(model, targetApi, credential.orgId ?? FACTORY_ORG_ID, apiEndpoint);
 
-    const routedContext = foldSystemPromptIntoUserMessage(context);
+    const folded = foldSystemPromptIntoUserMessage(context);
+    const droidSystemPrompt = loadDroidSystemPrompt(targetApi);
+    if (!droidSystemPrompt) {
+      return errorStream(
+        model,
+        "factory: missing local Droid system prompt under .contract/; run `bun run capture:contract` then retry",
+      );
+    }
+    const routedContext = { ...folded, systemPrompt: [droidSystemPrompt] };
 
     const inner = streamSimple(target, routedContext, {
       ...options,

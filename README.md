@@ -1,8 +1,8 @@
 # Pi Provider Factory
 
-**Pi Provider Factory is an Oh My Pi provider extension for using Factory.ai Droid models from `omp`, including Claude Opus, Claude Sonnet, GPT, Codex, GLM, Kimi, DeepSeek, MiniMax, and Nemotron models through Factory's authenticated LLM gateway.**
+**Pi Provider Factory is an Oh My Pi provider extension for using Factory.ai Droid models from `omp`, including Claude Opus, Claude Sonnet, Claude Fable, GPT, Codex, Grok, Gemini, GLM, Kimi, DeepSeek, MiniMax, Nemotron, and Inkling models through Factory's authenticated LLM gateway.**
 
-Last updated: 2026-07-30
+Last updated: 2026-09-17
 
 ## What this package does
 
@@ -12,18 +12,21 @@ Use it when you want:
 
 - Factory.ai model access inside `omp`
 - Droid-style Factory OAuth device login at `https://auth.factory.ai/device`
-- Factory-routed Claude, GPT, Codex, and open-weight coding models
+- Factory-routed Claude, GPT, Codex, Grok, Gemini, and open-weight coding models
 - Region-aware Factory API routing, including EU residency endpoints
 - One provider namespace for Factory models such as `factory/claude-opus-4-8` and `factory/gpt-5.5`
 
 ## Supported models
 
-The extension ships a 31-model curated static catalog, force-refreshes Factory's public model docs when an `omp` session starts, and merges any additional supported model IDs the docs list.
+The extension ships a 52-model static catalog, force-refreshes Factory's public model docs and live `/api/feature-flags` routing map when an `omp` session starts, and merges any additional routeable model IDs those sources list. The lists below include every model in the shipped catalog plus the additional IDs currently returned by Factory's live sources. Live-only IDs can change as Factory's catalog and deprecation schedule change. `qwen3.8-max` is omitted because this provider does not currently route `qwen-*` IDs.
 
 ### Claude and Anthropic-family models
 
 These models route through Factory's Anthropic-compatible gateway:
 
+- `claude-opus-5`
+- `claude-opus-5-fast`
+- `claude-fable-5.1`
 - `claude-opus-4-8`
 - `claude-opus-4-8-fast`
 - `claude-opus-4-7`
@@ -41,30 +44,76 @@ These models route through Factory's Anthropic-compatible gateway:
 
 These models route through Factory's OpenAI Responses-compatible gateway:
 
+- `gpt-5.6-sol`
+- `gpt-5.6-sol-fast`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
 - `gpt-5.5`
 - `gpt-5.5-fast`
 - `gpt-5.5-pro`
 - `gpt-5.4`
 - `gpt-5.4-fast`
 - `gpt-5.4-mini`
+- `gpt-5.4-mini-fast`
 - `gpt-5.3-codex`
 - `gpt-5.3-codex-fast`
 - `gpt-5.2`
 
+### Grok models
+
+These models use Factory's OpenAI Responses-compatible gateway with `x-api-provider: xai`:
+
+- `grok-4.6`
+- `grok-4.5`
+
+### Gemini models
+
+These models use Factory's OpenAI Chat Completions-compatible gateway with `x-api-provider: google`:
+
+- `gemini-3.1-pro-preview`
+- `gemini-3.7-flash`
+- `gemini-3.6-flash`
+- `gemini-3.5-flash`
+- `gemini-3-flash-preview`
+
 ### Factory Core and open-weight chat models
 
-These models route through Factory's OpenAI chat-completions-compatible gateway:
+These models use Factory's OpenAI Chat Completions-compatible gateway with `x-api-provider: fireworks`, except MiniMax, which uses the Anthropic-compatible wire API:
 
+- `glm-5.3-flash`
+- `glm-5.3`
 - `glm-5.2`
+- `glm-5.2-fast`
 - `glm-5.1`
+- `kimi-k3`
 - `kimi-k2.7-code`
 - `kimi-k2.6`
 - `kimi-k2.5`
 - `deepseek-v4-pro`
+- `deepseek-v4-flash-0731`
+- `inkling`
 - `minimax-m3`
 - `minimax-m2.7`
 - `minimax-m2.5`
 - `nemotron-3-ultra`
+
+### Additional live-discovered models
+
+Factory's current model docs and `/api/feature-flags` routing map also return these routeable IDs. They are added after a live catalog refresh rather than shipped in the static overlay:
+
+- `gpt-6-astra`
+- `gpt-5-2025-08-07`
+- `gpt-5.1`
+- `gemini-3.8-flash`
+- `deepseek-v4.1-flash`
+
+The live routing map still advertises these deprecated GPT IDs, so discovery can expose them until Factory removes them:
+
+- `gpt-5-codex`
+- `gpt-5.1-codex`
+- `gpt-5.2-codex`
+
+The dynamic catalog is limited to model IDs whose family the provider can route. Factory may list other models, such as `qwen3.8-max`, that are not supported by this extension.
 
 ## Request routing
 
@@ -86,7 +135,10 @@ https://api.eu.factory.ai
 | --- | --- | --- | --- |
 | Claude / Anthropic | `${apiEndpoint}/api/llm/a` | Anthropic Messages `/v1/messages` | `x-api-provider: anthropic` |
 | GPT / Codex | `${apiEndpoint}/api/llm/o/v1` | OpenAI Responses `/responses` | `x-api-provider: openai` |
-| GLM / Kimi / DeepSeek / MiniMax / Nemotron | `${apiEndpoint}/api/llm/o/v1` | OpenAI Chat Completions `/chat/completions` | `x-api-provider: factory` |
+| Grok | `${apiEndpoint}/api/llm/o/v1` | OpenAI Responses `/responses` | `x-api-provider: xai` |
+| Gemini | `${apiEndpoint}/api/llm/o/v1` | OpenAI Chat Completions `/chat/completions` | `x-api-provider: google` |
+| GLM / Kimi / DeepSeek / Nemotron / Inkling | `${apiEndpoint}/api/llm/o/v1` | OpenAI Chat Completions `/chat/completions` | `x-api-provider: fireworks` |
+| MiniMax | `${apiEndpoint}/api/llm/a` | Anthropic Messages `/v1/messages` | `x-api-provider: fireworks` |
 
 Examples:
 
@@ -297,7 +349,7 @@ reply with the single word ok
 
 ### What is Pi Provider Factory?
 
-Pi Provider Factory is an Oh My Pi extension that adds a `factory` provider for Factory.ai's Droid LLM gateway. It lets `omp` use Factory-routed Claude, GPT, Codex, and open-weight coding models with Droid-compatible OAuth and request headers.
+Pi Provider Factory is an Oh My Pi extension that adds a `factory` provider for Factory.ai's Droid LLM gateway. It lets `omp` use Factory-routed Claude, GPT, Codex, Grok, Gemini, and open-weight coding models with Droid-compatible OAuth and request headers.
 
 ### Does this call Anthropic or OpenAI directly?
 
@@ -313,17 +365,19 @@ No. Requests go to Factory's gateway first. Factory then routes each request to 
 
 ### Which endpoint do Factory Core models use?
 
-Most Factory Core open-weight models — `glm-5.2`, `glm-5.1`, `kimi-k2.7-code`, `kimi-k2.6`, `kimi-k2.5`, `deepseek-v4-pro`, `nemotron-3-ultra` — use `${apiEndpoint}/api/llm/o/v1/chat/completions`. MiniMax models (`minimax-m3`, `minimax-m2.7`, `minimax-m2.5`) are the exception: Factory serves them through the Anthropic-compatible endpoint `${apiEndpoint}/api/llm/a/v1/messages`. Every Factory Core model sends `x-api-provider: fireworks`.
+Most Factory Core open-weight models, including GLM, Kimi, DeepSeek, Inkling, and Nemotron, use `${apiEndpoint}/api/llm/o/v1/chat/completions`. MiniMax models (`minimax-m3`, `minimax-m2.7`, `minimax-m2.5`) are the exception: Factory serves them through the Anthropic-compatible endpoint `${apiEndpoint}/api/llm/a/v1/messages`. Every Factory Core model sends `x-api-provider: fireworks`.
 
 ### What `x-api-provider` value does each request send?
 
 Factory's gateway routes by the `x-api-provider` request header, which names the upstream and is independent of the API shape. Values are taken from observed `droid` CLI traffic:
 
-- `anthropic` — Claude models (Anthropic endpoint)
-- `openai` — GPT and Codex models (OpenAI Responses endpoint)
-- `fireworks` — all Droid Core open models (GLM, Kimi, DeepSeek, MiniMax, Nemotron), including MiniMax which is served over the Anthropic API shape
+- `anthropic`, Claude models (Anthropic endpoint)
+- `openai`, GPT and Codex models (OpenAI Responses endpoint)
+- `xai`, Grok models (OpenAI Responses endpoint)
+- `google`, Gemini models (OpenAI Chat Completions endpoint)
+- `fireworks`, all Droid Core open models (GLM, Kimi, DeepSeek, MiniMax, Nemotron, and Inkling), including MiniMax, which is served over the Anthropic API shape
 
-Sending the wrong value (for example `factory` for an open model) makes the gateway reject the request with `400 {"detail":"Invalid x-api-provider header"}`.
+Sending the wrong value, for example `factory` for an open model, makes the gateway reject the request with `400 {"detail":"Invalid x-api-provider header"}`.
 
 ### How does the extension handle system prompts?
 

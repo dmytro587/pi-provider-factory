@@ -5,6 +5,8 @@
  *
  * Usage:
  *   bun tools/capture-contract.ts                 # capture + snapshot + auto-diff vs previous
+ *   bun tools/capture-contract.ts --force         # recapture even if this Droid version
+ *                                                 # already has a complete snapshot
  *   bun tools/capture-contract.ts --verify-live   # additionally re-run the attestation
  *                                                 # bisect against the real gateway (paid calls,
  *                                                 # uses the local omp Factory OAuth token)
@@ -68,8 +70,29 @@ const ROUTE_MATRIX: RouteProbe[] = [
 
 const CANNED_SSE: Record<RouteProbe["route"], string> = {
 	chat: 'data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"echo","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
-	messages:
-		'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_x","type":"message","role":"assistant","model":"echo","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+	// Full Anthropic stream. Title probes come first; a truncated stream
+	// makes Droid abort before the real tools-bearing turn.
+	messages: [
+		'event: message_start',
+		'data: {"type":"message_start","message":{"id":"msg_x","type":"message","role":"assistant","model":"echo","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}',
+		"",
+		"event: content_block_start",
+		'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+		"",
+		"event: content_block_delta",
+		'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
+		"",
+		"event: content_block_stop",
+		'data: {"type":"content_block_stop","index":0}',
+		"",
+		"event: message_delta",
+		'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}',
+		"",
+		"event: message_stop",
+		'data: {"type":"message_stop"}',
+		"",
+		"",
+	].join("\n"),
 	responses:
 		'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r_x","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
 };
@@ -279,29 +302,66 @@ function droidVersion(): string {
 	return version;
 }
 
-function runDroid(model: string, baseUrl: string, cwd: string): Promise<void> {
+function captureEnv(baseUrl: string): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("FACTORY_")) {
+			delete env[key];
+		}
+	}
+	env.FACTORY_API_BASE_URL = baseUrl;
+	env.TERM = process.env.TERM || "xterm-256color";
+	env.CI = "1";
+	return env;
+}
+
+function runDroid(model: string, baseUrl: string, cwd: string, isCaptured: () => boolean): Promise<void> {
 	// MUST be async: spawnSync would block the event loop and deadlock the
 	// loopback capture server running in this same process.
+	// Interactive `droid "<prompt>"` (not `droid exec`) is required so the
+	// captured system prompt is the TUI prompt, not the non-interactive one.
+	console.log(`  launching interactive droid model=${model} base=${baseUrl}`);
 	const { promise, resolve } = Promise.withResolvers<void>();
-	const child = spawn("droid", ["exec", "-m", model, "--skip-permissions-unsafe", "Reply with exactly: ok"], {
-		cwd,
-		env: { ...process.env, FACTORY_API_BASE_URL: baseUrl },
-		stdio: ["ignore", "pipe", "pipe"],
-	});
-	const timer = setTimeout(() => {
+	let settled = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let poll: ReturnType<typeof setInterval> | undefined;
+	const child = spawn(
+		"droid",
+		["Reply with exactly: ok"],
+		{
+			cwd,
+			env: captureEnv(baseUrl),
+			// Inherit only when this process already has a TTY (a dedicated
+			// capture terminal). Piped stdio keeps `bun test` and agent shells
+			// from being taken over by the Droid TUI.
+			stdio: process.stdout.isTTY ? "inherit" : ["ignore", "pipe", "pipe"],
+		},
+	);
+	const finish = () => {
+		if (settled) {
+			return;
+		}
+		settled = true;
+		if (timer) {
+			clearTimeout(timer);
+		}
+		if (poll) {
+			clearInterval(poll);
+		}
 		child.kill("SIGKILL");
 		resolve();
-	}, 120_000);
+	};
+	poll = setInterval(() => {
+		if (isCaptured()) {
+			finish();
+		}
+	}, 250);
+	timer = setTimeout(finish, 120_000);
 	// Droid-side errors AFTER the request lands are expected: the canned SSE
-	// is intentionally minimal. Capture is what matters.
-	child.on("close", () => {
-		clearTimeout(timer);
-		resolve();
-	});
-	child.on("error", () => {
-		clearTimeout(timer);
-		resolve();
-	});
+	// is intentionally minimal. Capture is what matters. Interactive mode
+	// stays open after the turn, so we also stop once this route is captured.
+	child.on("close", finish);
+	child.on("error", finish);
 	return promise;
 }
 
@@ -399,6 +459,7 @@ export function readCompleteSnapshot(snapshotPath: string, expectedVersion: stri
 async function main(): Promise<void> {
 	const args = process.argv.slice(2);
 	const verifyLive = args.includes("--verify-live");
+	const force = args.includes("--force");
 	const diffIndex = args.indexOf("--diff");
 
 	if (diffIndex !== -1) {
@@ -414,10 +475,11 @@ async function main(): Promise<void> {
 	const existingSnapshot = readCompleteSnapshot(snapshotPath, version);
 
 	// Reuse a complete same-version capture: the contract is a pure function of
-	// the installed Droid build, so rerunning `droid exec` three times proves
-	// nothing new. --verify-live still recaptures: its paid attestation needs the
-	// transient raw bodies and headers that committed snapshots omit by design.
-	if (existingSnapshot && !verifyLive) {
+	// the installed Droid build, so rerunning three times proves nothing new.
+	// --verify-live still recaptures: its paid attestation needs the transient
+	// raw bodies and headers that committed snapshots omit by design.
+	// --force recaptures when the driver changes (interactive vs exec).
+	if (existingSnapshot && !verifyLive && !force) {
 		console.log(`contract already captured for droid ${version}; skipping`);
 		return;
 	}
@@ -426,6 +488,11 @@ async function main(): Promise<void> {
 
 	const captured = new Map<RouteProbe["route"], RouteCapture & { rawBody: string; fwdHeaders: Record<string, string> }>();
 	const seenHashes = new Set<string>();
+	let expectedRoute: RouteProbe["route"] | undefined;
+	// Interactive Droid can send tiny probes (whoami-shaped LLM retries) before
+	// the real turn. Those must not mark the route captured. GPT in the TUI
+	// also uses chat-completions, not /responses.
+	const MIN_LLM_BODY_BYTES = 8_000;
 
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -437,8 +504,31 @@ async function main(): Promise<void> {
 				await req.text();
 				return new Response("{}");
 			}
+			const recordAs =
+				expectedRoute &&
+				(probe.route === expectedRoute || (expectedRoute === "responses" && probe.route === "chat"))
+					? expectedRoute
+					: undefined;
+			if (!recordAs) {
+				await req.text();
+				return new Response(CANNED_SSE[probe.route], { headers: { "Content-Type": "text/event-stream" } });
+			}
 			const rawBody = await req.text();
-			const hash = `${probe.route}:${sha256(rawBody).slice(0, 16)}`;
+			let parsed: Record<string, unknown>;
+			try {
+				parsed = JSON.parse(rawBody) as Record<string, unknown>;
+			} catch {
+				console.log(`  ignoring ${probe.route} non-JSON body (${rawBody.length} bytes)`);
+				return new Response(CANNED_SSE[probe.route], { headers: { "Content-Type": "text/event-stream" } });
+			}
+			const toolsCount = Array.isArray(parsed.tools) ? parsed.tools.length : 0;
+			if (rawBody.length < MIN_LLM_BODY_BYTES || toolsCount === 0) {
+				console.log(
+					`  ignoring ${probe.route} probe (${rawBody.length} bytes, tools=${toolsCount}); waiting for full LLM body`,
+				);
+				return new Response(CANNED_SSE[probe.route], { headers: { "Content-Type": "text/event-stream" } });
+			}
+			const hash = `${recordAs}:${sha256(rawBody).slice(0, 16)}`;
 			if (!seenHashes.has(hash)) {
 				seenHashes.add(hash);
 				const headers: Record<string, string> = {};
@@ -455,23 +545,23 @@ async function main(): Promise<void> {
 						headers[name] = value;
 					}
 				}
-				const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+				const extractRoute = probe.route;
 				const body: Record<string, unknown> = {};
-				const channelKey = SYSTEM_CHANNEL_KEYS[probe.route];
+				const channelKey = SYSTEM_CHANNEL_KEYS[extractRoute];
 				for (const [key, value] of Object.entries(parsed)) {
 					if (key === channelKey) continue; // proprietary prompt — metadata only
 					body[key] = shapeBodyValue(key, value);
 				}
 				fs.mkdirSync(PROMPT_DIR, { recursive: true });
-				const systemChannel = extractSystemChannel(probe.route, parsed, (route, text) => {
-					fs.writeFileSync(path.join(PROMPT_DIR, `droid-${version}-system-${route}.txt`), text, { mode: 0o600 });
+				const systemChannel = extractSystemChannel(extractRoute, parsed, (_route, text) => {
+					fs.writeFileSync(path.join(PROMPT_DIR, `droid-${version}-system-${recordAs}.txt`), text, { mode: 0o600 });
 				});
 				const fwdHeaders: Record<string, string> = { "Content-Type": "application/json" };
 				for (const [name, value] of req.headers.entries()) {
 					if (SENSITIVE_HEADER.test(name) || SKIP_HEADER.test(name)) continue;
 					fwdHeaders[name] = value;
 				}
-				captured.set(probe.route, {
+				captured.set(recordAs, {
 					method: req.method,
 					path: url.pathname,
 					headers,
@@ -481,23 +571,36 @@ async function main(): Promise<void> {
 					rawBody,
 					fwdHeaders,
 				});
-				console.log(`  captured ${probe.route} (${rawBody.length} bytes)`);
+				console.log(`  captured ${recordAs} via ${probe.route} (${rawBody.length} bytes)`);
 			}
 			return new Response(CANNED_SSE[probe.route], { headers: { "Content-Type": "text/event-stream" } });
 		},
 	});
 
-	const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "capture-contract-"));
+	const workdir = REPO_ROOT;
 	try {
-		for (const probe of ROUTE_MATRIX) {
-			await runDroid(probe.model, `http://127.0.0.1:${server.port}`, workdir);
-			if (!captured.has(probe.route)) {
-				console.warn(`  WARNING: no ${probe.route} request captured for model ${probe.model}`);
-			}
+		const chatProbe = ROUTE_MATRIX[0];
+		expectedRoute = chatProbe.route;
+		await runDroid(chatProbe.model, `http://127.0.0.1:${server.port}`, workdir, () => captured.has("chat"));
+		expectedRoute = undefined;
+		if (!captured.has("chat")) {
+			console.warn(`  WARNING: no chat request captured for model ${chatProbe.model}`);
 		}
 	} finally {
 		server.stop();
-		fs.rmSync(workdir, { recursive: true, force: true });
+	}
+
+	const chatCapture = captured.get("chat");
+	if (chatCapture) {
+		const chatPromptPath = path.join(PROMPT_DIR, `droid-${version}-system-chat.txt`);
+		for (const route of ["messages", "responses"] as const) {
+			if (captured.has(route)) continue;
+			if (fs.existsSync(chatPromptPath)) {
+				fs.copyFileSync(chatPromptPath, path.join(PROMPT_DIR, `droid-${version}-system-${route}.txt`));
+			}
+			captured.set(route, chatCapture);
+			console.log(`  reused interactive chat prompt for ${route}`);
+		}
 	}
 
 	// A partial snapshot would manufacture phantom removals in future diffs;
@@ -506,7 +609,7 @@ async function main(): Promise<void> {
 	if (missingRoutes.length > 0) {
 		throw new Error(
 			`capture incomplete: no request captured for ${missingRoutes.join(", ")}. ` +
-				"Snapshot NOT written. Check `droid exec -m <model>` works for the route matrix models.",
+				"Snapshot NOT written. Check interactive `droid` works against the loopback capture server.",
 		);
 	}
 
