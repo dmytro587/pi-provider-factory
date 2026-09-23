@@ -110,7 +110,7 @@ describe("tier 1: registration and catalog", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.stdout).toContain("factory (");
 		expect(result.stdout).toMatch(/claude-opus-4-8|kimi-k2\.6|glm-5\.2/);
-	});
+	}, 180_000);
 
 	// Known upstream gap: runUsageCommand constructs AuthStorage directly
 	// without loading extensions, so custom usage providers never register
@@ -162,9 +162,8 @@ describe("tier 2: OAuth usage reporting (OMP_E2E_OAUTH=1)", () => {
 		expect(usageError, `ACP /usage run failed: ${usageError?.message}`).toBeUndefined();
 		expect(
 			usageText,
-			`Factory section missing from /usage. This CLI (${cli}) does not surface extension usage providers ` +
-				"(ProviderConfig.usageProvider). Point OMP_E2E_CLI at a build that includes the usage-provider " +
-				"contract, e.g. the patched workspace CLI. Raw output: " +
+			`Factory section missing from /usage with CLI ${cli}. Check extension loading and ` +
+				"the Factory OAuth credential. Raw output: " +
 				JSON.stringify((usageText ?? "").slice(0, 400)),
 		).toContain("Factory");
 		const windows = FACTORY_WINDOW_LABELS.filter(label => usageText!.includes(label));

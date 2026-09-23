@@ -229,7 +229,9 @@ Queries use the same base-URL precedence as model routing (`FACTORY_API_BASE`, t
 
 The billing-limits endpoint is queried with OAuth credentials only. Factory `fk-...` API keys are intentionally never sent to it (a live probe returns `401`), so with only `FACTORY_API_KEY` configured, model calls still work but `/usage` shows no Factory billing limits by design.
 
-Usage-provider registration for extensions requires an Oh My Pi release that includes it; on older releases Factory simply does not appear in `/usage` while model routing is unaffected.
+Usage reporting requires Oh My Pi 18.2.11 or newer. Once `/usage` fetches Factory quotas, Oh My Pi records limit snapshots for its quota history and the Stats page's Window Utilization panel. An OAuth login is required; API keys alone cannot fetch billing limits.
+
+The `/usage` Activity heatmap counts recorded model requests from the local Stats database, across all providers. Factory requests contribute to the same heatmap, with no separate Factory row; fetching quota windows does not itself add activity.
 
 ### Organization and region handling
 

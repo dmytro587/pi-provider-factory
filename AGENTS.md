@@ -32,10 +32,9 @@ bun run test:e2e            # gated e2e, see below
 - E2E (`e2e/cli.e2e.ts`) drives the real omp CLI against an isolated profile
   and is gated by env vars: `OMP_E2E_OAUTH=1`, `OMP_E2E_API_KEY=fk-...`,
   `OMP_E2E_MODEL_CALL=1` (real model spend). Default runs skip live tiers.
-- Known current state (2026-09-15): `src/model-refresh.test.ts` has 1 failing
-  test (parseFactoryModelDocs keeps new families) and `typecheck` fails on
-  `usageProvider` / `notes` typings against the installed pi peer deps. Fix or
-  update these when touching catalog/usage code; do not add new failures.
+- Known current state (2026-09-24): `src/model-refresh.test.ts` has 1 failing
+  test (parseFactoryModelDocs keeps new families). Do not add new failures.
+  The Factory usage provider requires Oh My Pi 18.2.11 or newer (`usage` registration).
 
 ## Conventions
 

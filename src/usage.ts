@@ -227,6 +227,7 @@ function resolveUsageBaseUrl(params: UsageFetchParams): string {
 }
 
 export const factoryUsageProvider = {
+  id: PROVIDER_ID,
   // The endpoint authenticates the bearer, so a fetch doubles as a health check.
   validatesCredentials: true,
 
@@ -305,4 +306,4 @@ export const factoryUsageProvider = {
     }
     return report;
   },
-} satisfies Omit<UsageProvider, "id">;
+} satisfies UsageProvider;

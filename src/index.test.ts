@@ -47,10 +47,11 @@ describe("registerFactoryProvider", () => {
 
   test("only the first registration owns streaming, usage, and OAuth", () => {
     expect(recorded[0]?.config.streamSimple).toBeDefined();
-    expect(recorded[0]?.config.usageProvider).toBeDefined();
+    expect(recorded[0]?.config.usage).toBeDefined();
+    expect(recorded[0]?.config.usage?.id).toBe(PROVIDER_ID);
     expect(recorded[0]?.config.oauth).toBeDefined();
     expect(recorded[1]?.config.streamSimple).toBeUndefined();
-    expect(recorded[1]?.config.usageProvider).toBeUndefined();
+    expect(recorded[1]?.config.usage).toBeUndefined();
     expect(recorded[1]?.config.oauth).toBeUndefined();
   });
 

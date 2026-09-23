@@ -35,7 +35,7 @@ export default function registerFactoryProvider(pi: ExtensionAPI) {
     ...FACTORY_PROVIDER_TRANSPORT,
     models: FACTORY_MODELS,
     streamSimple: factoryStreamSimple,
-    usageProvider: factoryUsageProvider,
+    usage: factoryUsageProvider,
     oauth: {
       name: "Factory (Droid)",
       login,
